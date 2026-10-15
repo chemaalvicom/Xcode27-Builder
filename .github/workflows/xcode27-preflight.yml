@@ -1,0 +1,66 @@
+name: Xcode 27 Apple Silicon Preflight
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/xcode27-preflight.yml
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    name: Apple Silicon / Xcode 27 / iOS SDK 27
+    runs-on: xcode-27
+    timeout-minutes: 10
+
+    steps:
+      - name: Verify environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "============================================================"
+          echo "XCODE27-BUILDER PREFLIGHT"
+          echo "============================================================"
+          echo "RUNNER_OS=${RUNNER_OS:-unknown}"
+          echo "RUNNER_ARCH=${RUNNER_ARCH:-unknown}"
+          echo
+          echo "--- HARDWARE / OS ---"
+          uname -a
+          echo "ARCH=$(uname -m)"
+          sw_vers
+          echo
+          echo "--- XCODE ---"
+          xcode-select -p
+          xcodebuild -version
+          echo
+          echo "--- IOS SDK ---"
+          IOS_SDK_VERSION="$(xcrun --sdk iphoneos --show-sdk-version)"
+          IOS_SDK_PATH="$(xcrun --sdk iphoneos --show-sdk-path)"
+          echo "IOS_SDK_VERSION=${IOS_SDK_VERSION}"
+          echo "IOS_SDK_PATH=${IOS_SDK_PATH}"
+          echo
+          echo "--- TOOLCHAIN ---"
+          xcrun swift --version
+          xcrun clang --version
+          echo
+          echo "--- INSTALLED XCODE APPS ---"
+          ls -1 /Applications | grep '^Xcode' || true
+          echo
+          echo "--- INSTALLED SDKS ---"
+          xcodebuild -showsdks
+          echo
+          echo "--- ASSERTIONS ---"
+          test "$(uname -m)" = "arm64"
+          XCODE_MAJOR="$(xcodebuild -version | awk '/Xcode/{print $2}' | cut -d. -f1)"
+          IOS_SDK_MAJOR="$(printf '%s' "$IOS_SDK_VERSION" | cut -d. -f1)"
+          test "$XCODE_MAJOR" -ge 27
+          test "$IOS_SDK_MAJOR" -ge 27
+          echo
+          echo "RESULT=GREEN"
+          echo "APPLE_SILICON=YES"
+          echo "XCODE_27=YES"
+          echo "IOS_SDK_27=YES"
