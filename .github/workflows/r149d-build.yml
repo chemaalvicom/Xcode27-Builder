@@ -1,0 +1,155 @@
+name: R149D Private Source - Xcode 27 Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Private source branch/ref
+        required: true
+        default: lab/homeassistant-cameras-carplay-r9
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/r149d-build.yml
+
+permissions:
+  contents: read
+
+jobs:
+  build-r149d:
+    name: R149D / Xcode 27 / iOS 27
+    runs-on: xcode-27
+    timeout-minutes: 120
+
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.app/Contents/Developer
+      SOURCE_REF: ${{ github.event.inputs.source_ref || 'lab/homeassistant-cameras-carplay-r9' }}
+
+    steps:
+      - name: Gate private-repository credential
+        shell: bash
+        env:
+          PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PRIVATE_REPO_TOKEN:-}" ]; then
+            echo "PRIVATE_REPO_TOKEN_MISSING=YES"
+            echo "Create the PRIVATE_REPO_TOKEN Actions secret before running R149D."
+            exit 78
+          fi
+          echo "PRIVATE_REPO_TOKEN_PRESENT=YES"
+
+      - name: Checkout private R149D source
+        uses: actions/checkout@v4
+        with:
+          repository: chemaalvicom/HomeAssistant-CarPlay-Cameras
+          ref: ${{ env.SOURCE_REF }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          path: source
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify Xcode 27 environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "ARCH=$(uname -m)"
+          xcodebuild -version
+          echo "IOS_SDK=$(xcrun --sdk iphoneos --show-sdk-version)"
+          test "$(uname -m)" = "arm64"
+          test "$(xcodebuild -version | awk '/Xcode/{print $2}' | cut -d. -f1)" -ge 27
+          test "$(xcrun --sdk iphoneos --show-sdk-version | cut -d. -f1)" -ge 27
+          echo "XCODE27_GATE=GREEN"
+
+      - name: Verify R149D source without exposing source
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          CAM="Sources/CarPlay/Templates/Entities/CarPlayCameraControlTemplate.swift"
+          test -f "$CAM"
+          grep -q 'CPListImageRowItemCardElement' "$CAM"
+          grep -q 'cardElements:' "$CAM"
+          grep -q 'getCameraSnapshot' "$CAM"
+          echo "SOURCE_HEAD=$(git rev-parse HEAD)"
+          echo "R149D_SOURCE=GREEN"
+          echo "R146_SNAPSHOT_PIPELINE=GREEN"
+
+      - name: Stabilize SwiftPM transport
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global http.version HTTP/1.1
+          git config --global http.postBuffer 524288000
+          git config --global http.maxRequests 4
+          git config --global core.compression 0
+          echo "SPM_TRANSPORT=STABILIZED"
+
+      - name: Resolve Swift packages
+        working-directory: source
+        shell: bash
+        run: |
+          set -uo pipefail
+          LOG="$RUNNER_TEMP/r149d-spm.log"
+          set +e
+          xcodebuild \
+            -resolvePackageDependencies \
+            -project HomeAssistant.xcodeproj \
+            -scheme App-Release \
+            >"$LOG" 2>&1
+          RC=$?
+          set -e
+          echo "SPM_RC=$RC"
+          if [ "$RC" -ne 0 ]; then
+            echo "R149D_SPM=RED"
+            echo "----- FILTERED SPM ERRORS -----"
+            grep -E 'error:|fatal error:|failed|Could not|cannot|unable to' "$LOG" \
+              | sed "s#${GITHUB_WORKSPACE}/source#\$SRCROOT#g" \
+              | tail -100 || true
+            exit "$RC"
+          fi
+          echo "R149D_SPM=GREEN"
+
+      - name: Compile R149D with Xcode 27
+        working-directory: source
+        shell: bash
+        run: |
+          set -uo pipefail
+          LOG="$RUNNER_TEMP/r149d-xcodebuild.log"
+          DERIVED="$RUNNER_TEMP/R149D_DerivedData"
+          set +e
+          xcodebuild \
+            -project HomeAssistant.xcodeproj \
+            -scheme App-Release \
+            -configuration Debug \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$DERIVED" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build \
+            >"$LOG" 2>&1
+          RC=$?
+          set -e
+          echo "XCODEBUILD_RC=$RC"
+          if [ "$RC" -ne 0 ]; then
+            echo "R149D_COMPILE=RED"
+            echo "----- FILTERED COMPILER ERRORS -----"
+            grep -E 'error:|fatal error:|BUILD FAILED|CPListImageRowItemCardElement|cardElements:' "$LOG" \
+              | sed "s#${GITHUB_WORKSPACE}/source#\$SRCROOT#g" \
+              | tail -160 || true
+            exit "$RC"
+          fi
+          echo "R149D_COMPILE=GREEN"
+          echo "BUILD_SUCCEEDED=YES"
+
+      - name: Final result
+        shell: bash
+        run: |
+          echo "============================================================"
+          echo "R149D GITHUB XCODE 27 BUILD = GREEN"
+          echo "============================================================"
+          xcodebuild -version
+          echo "IOS_SDK=$(xcrun --sdk iphoneos --show-sdk-version)"
