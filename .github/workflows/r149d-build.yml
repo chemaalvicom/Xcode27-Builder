@@ -123,7 +123,6 @@ jobs:
             -project HomeAssistant.xcodeproj \
             -scheme App-Release \
             -configuration Debug \
-            -sdk iphoneos \
             -destination 'generic/platform=iOS' \
             -derivedDataPath "$DERIVED" \
             CODE_SIGNING_ALLOWED=NO \
@@ -137,9 +136,9 @@ jobs:
           if [ "$RC" -ne 0 ]; then
             echo "R149D_COMPILE=RED"
             echo "----- FILTERED COMPILER ERRORS -----"
-            grep -E 'error:|fatal error:|BUILD FAILED|CPListImageRowItemCardElement|cardElements:' "$LOG" \
+            grep -E 'error:|fatal error:|BUILD FAILED|CPListImageRowItemCardElement|cardElements:|Target .Shared' "$LOG" \
               | sed "s#${GITHUB_WORKSPACE}/source#\$SRCROOT#g" \
-              | tail -160 || true
+              | tail -200 || true
             exit "$RC"
           fi
           echo "R149D_COMPILE=GREEN"
