@@ -1,0 +1,28 @@
+name: Launch R149D Signed IPA
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/trigger-r149d-signed
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  launch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Dispatch signed Xcode 27 build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh workflow run r149d-signed-ipa.yml \
+            --repo chemaalvicom/Xcode27-Builder \
+            --ref main \
+            -f source_ref=lab/homeassistant-cameras-carplay-r9
+          echo "SIGNED_R149D_DISPATCHED=YES"
