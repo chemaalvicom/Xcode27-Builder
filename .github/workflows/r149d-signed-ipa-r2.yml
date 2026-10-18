@@ -1,0 +1,461 @@
+name: R149D Signed IPA R2 - Xcode 27
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Private source branch/ref
+        required: true
+        default: lab/homeassistant-cameras-carplay-r9
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/r149d-signed-ipa-r2.yml
+
+permissions:
+  contents: read
+
+jobs:
+  signed-ipa:
+    name: R149D signed IPA R2 / Xcode 27
+    runs-on: xcode-27
+    timeout-minutes: 120
+
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.app/Contents/Developer
+      SOURCE_REF: ${{ github.event.inputs.source_ref || 'lab/homeassistant-cameras-carplay-r9' }}
+      PRIVATE_SOURCE_REPO: chemaalvicom/HomeAssistant-CarPlay-Cameras
+
+    steps:
+      - name: Gate required secrets
+        shell: bash
+        env:
+          PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          PRIVATE_OUTPUT_TOKEN: ${{ secrets.PRIVATE_OUTPUT_TOKEN }}
+          HA_DISTRIBUTION_P12_B64: ${{ secrets.HA_DISTRIBUTION_P12_B64 }}
+          HA_DISTRIBUTION_P12_PASSWORD: ${{ secrets.HA_DISTRIBUTION_P12_PASSWORD }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_PRIVATE_KEY_B64: ${{ secrets.ASC_PRIVATE_KEY_B64 }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for name in \
+            PRIVATE_REPO_TOKEN \
+            PRIVATE_OUTPUT_TOKEN \
+            HA_DISTRIBUTION_P12_B64 \
+            HA_DISTRIBUTION_P12_PASSWORD \
+            ASC_KEY_ID \
+            ASC_ISSUER_ID \
+            ASC_PRIVATE_KEY_B64
+          do
+            if [ -z "${!name:-}" ]; then
+              echo "MISSING_SECRET=$name"
+              missing=1
+            fi
+          done
+          test "$missing" -eq 0
+          echo "SIGNING_SECRETS_GATE=GREEN"
+
+      - name: Checkout private R149D source
+        uses: actions/checkout@v4
+        with:
+          repository: chemaalvicom/HomeAssistant-CarPlay-Cameras
+          ref: ${{ env.SOURCE_REF }}
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify Xcode 27 environment and R149D source
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "arm64"
+          test "$(xcodebuild -version | awk '/Xcode/{print $2}' | cut -d. -f1)" -ge 27
+          test "$(xcrun --sdk iphoneos --show-sdk-version | cut -d. -f1)" -ge 27
+          CAM="Sources/CarPlay/Templates/Entities/CarPlayCameraControlTemplate.swift"
+          test -f "$CAM"
+          grep -q 'CPListImageRowItemCardElement' "$CAM"
+          grep -q 'cardElements:' "$CAM"
+          grep -q 'getCameraSnapshot' "$CAM"
+          git rev-parse HEAD > "$RUNNER_TEMP/source_sha.txt"
+          echo "XCODE27_SOURCE_GATE=GREEN"
+
+      - name: Install Apple Distribution identity
+        shell: bash
+        env:
+          P12_B64: ${{ secrets.HA_DISTRIBUTION_P12_B64 }}
+          P12_PASSWORD: ${{ secrets.HA_DISTRIBUTION_P12_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/r149d-signing.keychain-db"
+          P12="$RUNNER_TEMP/r149d-distribution.p12"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
+          python3 - "$P12" <<'PY'
+          import base64, os, pathlib, sys
+          pathlib.Path(sys.argv[1]).write_bytes(base64.b64decode(os.environ['P12_B64']))
+          PY
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$P12" -k "$KEYCHAIN" -P "$P12_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security >/dev/null
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN"
+          COUNT="$(security find-identity -v -p codesigning "$KEYCHAIN" | grep -c 'Apple Distribution' || true)"
+          test "$COUNT" -ge 1
+          printf '%s\n' "$KEYCHAIN" > "$RUNNER_TEMP/keychain_path.txt"
+          echo "DISTRIBUTION_IDENTITY=GREEN"
+
+      - name: Install App Store Connect key
+        shell: bash
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_PRIVATE_KEY_B64: ${{ secrets.ASC_PRIVATE_KEY_B64 }}
+        run: |
+          set -euo pipefail
+          KEYDIR="$HOME/.appstoreconnect/private_keys"
+          mkdir -p "$KEYDIR"
+          KEYFILE="$KEYDIR/AuthKey_${ASC_KEY_ID}.p8"
+          python3 - "$KEYFILE" <<'PY'
+          import base64, os, pathlib, sys
+          pathlib.Path(sys.argv[1]).write_bytes(base64.b64decode(os.environ['ASC_PRIVATE_KEY_B64']))
+          PY
+          chmod 600 "$KEYFILE"
+          echo "ASC_KEY_INSTALLED=GREEN"
+
+      - name: Download active Home Assistant Ad Hoc profiles
+        shell: bash
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          PROFILE_DIR="$RUNNER_TEMP/r149d-profiles"
+          mkdir -p "$PROFILE_DIR"
+          export PROFILE_DIR
+          python3 <<'PY'
+          import base64, datetime as dt, json, os, pathlib, time, urllib.request
+          from cryptography.hazmat.primitives import hashes, serialization
+          from cryptography.hazmat.primitives.asymmetric import ec
+          from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
+
+          kid=os.environ['ASC_KEY_ID']; issuer=os.environ['ASC_ISSUER_ID']
+          out=pathlib.Path(os.environ['PROFILE_DIR'])
+          keypath=pathlib.Path.home()/'.appstoreconnect'/'private_keys'/f'AuthKey_{kid}.p8'
+          def b64u(raw): return base64.urlsafe_b64encode(raw).rstrip(b'=').decode()
+          key=serialization.load_pem_private_key(keypath.read_bytes(), password=None)
+          now=int(time.time())
+          h=b64u(json.dumps({'alg':'ES256','kid':kid,'typ':'JWT'},separators=(',',':')).encode())
+          p=b64u(json.dumps({'iss':issuer,'iat':now,'exp':now+900,'aud':'appstoreconnect-v1'},separators=(',',':')).encode())
+          msg=(h+'.'+p).encode(); der=key.sign(msg,ec.ECDSA(hashes.SHA256())); r,s=decode_dss_signature(der)
+          token=h+'.'+p+'.'+b64u(r.to_bytes(32,'big')+s.to_bytes(32,'big'))
+
+          url='https://api.appstoreconnect.apple.com/v1/profiles?limit=200&include=bundleId'
+          profiles=[]; included={}
+          while url:
+              req=urllib.request.Request(url,headers={'Authorization':'Bearer '+token})
+              with urllib.request.urlopen(req,timeout=60) as response: payload=json.load(response)
+              profiles.extend(payload.get('data',[]))
+              for item in payload.get('included',[]):
+                  if item.get('type')=='bundleIds': included[item['id']]=item.get('attributes',{}).get('identifier','')
+              url=payload.get('links',{}).get('next')
+
+          now_dt=dt.datetime.now(dt.timezone.utc); chosen={}
+          for item in profiles:
+              attr=item.get('attributes',{})
+              if attr.get('profileState')!='ACTIVE': continue
+              name=attr.get('name','')
+              if not name.startswith('HomeAssistant_CarPlay_'): continue
+              rel=item.get('relationships',{}).get('bundleId',{}).get('data') or {}
+              bundle=included.get(rel.get('id'),'')
+              if 'HomeAssistant.dev' not in bundle: continue
+              expiry_s=attr.get('expirationDate')
+              if not expiry_s: continue
+              expiry=dt.datetime.fromisoformat(expiry_s.replace('Z','+00:00'))
+              if expiry<=now_dt: continue
+              previous=chosen.get(bundle)
+              if previous is None or expiry>previous[0]: chosen[bundle]=(expiry,item)
+          if len(chosen)!=10: raise SystemExit(f'EXPECTED_10_ACTIVE_PROFILES_GOT_{len(chosen)}')
+          for index,(bundle,(_,item)) in enumerate(sorted(chosen.items()),1):
+              raw=base64.b64decode(item['attributes']['profileContent'])
+              (out/f'profile_{index:02d}.mobileprovision').write_bytes(raw)
+          print('PROFILES_DOWNLOADED=10')
+          PY
+
+      - name: Install profiles and derive signing map
+        shell: bash
+        run: |
+          set -euo pipefail
+          DIR="$RUNNER_TEMP/r149d-profiles"
+          DEST="$HOME/Library/MobileDevice/Provisioning Profiles"
+          mkdir -p "$DEST"
+          META="$RUNNER_TEMP/profile-meta.json"
+          printf '[]' > "$META"
+          for F in "$DIR"/*.mobileprovision; do
+            PLIST="$(mktemp)"
+            security cms -D -i "$F" > "$PLIST"
+            UUID=$(/usr/libexec/PlistBuddy -c 'Print :UUID' "$PLIST")
+            NAME=$(/usr/libexec/PlistBuddy -c 'Print :Name' "$PLIST")
+            APPID=$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$PLIST")
+            cp "$F" "$DEST/$UUID.mobileprovision"
+            python3 - "$META" "$NAME" "$APPID" <<'PY'
+          import json, pathlib, sys
+          path=pathlib.Path(sys.argv[1]); data=json.loads(path.read_text())
+          data.append({'name':sys.argv[2],'appid':sys.argv[3]}); path.write_text(json.dumps(data))
+          PY
+            rm -f "$PLIST"
+          done
+          python3 - "$META" "$RUNNER_TEMP/signing.env" <<'PY'
+          import json, pathlib, shlex, sys
+          items=json.loads(pathlib.Path(sys.argv[1]).read_text())
+          if len(items)!=10: raise SystemExit(f'EXPECTED_10_INSTALLED_PROFILES_GOT_{len(items)}')
+          records=[]; teams=set()
+          for item in items:
+              team,bundle=item['appid'].split('.',1); teams.add(team); records.append((bundle,item['name']))
+          if len(teams)!=1: raise SystemExit('PROFILE_TEAM_MISMATCH')
+          team=next(iter(teams))
+          suffixes={
+            'MAIN':'HomeAssistant.dev',
+            'INTENTS':'.Intents',
+            'MATTER':'.Matter',
+            'NOTIFICATION_CONTENT':'.NotificationContentExtension',
+            'NOTIFICATION_SERVICE':'.APNSAttachmentService',
+            'PUSH_PROVIDER':'.PushProvider',
+            'SHARE':'.ShareExtension',
+            'WIDGETS':'.Widgets',
+            'WATCH_APP':'.watchkitapp',
+            'WATCH_WIDGETS':'.watchkitapp.WatchWidgets',
+          }
+          picked={}; bundles={}
+          for key,suffix in suffixes.items():
+              matches=[]
+              for bundle,name in records:
+                  ok=(bundle.endswith(suffix) and '.watchkitapp' not in bundle) if key=='MAIN' else bundle.endswith(suffix)
+                  if ok: matches.append((bundle,name))
+              if len(matches)!=1: raise SystemExit(f'PROFILE_MAP_{key}_COUNT_{len(matches)}')
+              bundles[key],picked[key]=matches[0]
+          out=pathlib.Path(sys.argv[2])
+          with out.open('w') as f:
+              f.write('TEAM_ID='+shlex.quote(team)+'\n')
+              for key in suffixes:
+                  f.write('PROFILE_'+key+'='+shlex.quote(picked[key])+'\n')
+                  f.write('BUNDLE_'+key+'='+shlex.quote(bundles[key])+'\n')
+          PY
+          chmod 600 "$RUNNER_TEMP/signing.env"
+          echo "PROFILES_INSTALLED=10"
+          echo "SIGNING_MAP=GREEN"
+
+      - name: Stabilize SwiftPM and resolve packages
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global http.version HTTP/1.1
+          git config --global http.postBuffer 524288000
+          git config --global http.maxRequests 4
+          git config --global core.compression 0
+          xcodebuild -resolvePackageDependencies -project HomeAssistant.xcodeproj -scheme App-Debug > "$RUNNER_TEMP/r149d-spm.log" 2>&1
+          echo "R149D_SPM=GREEN"
+
+      - name: Build target-aware signing override
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/signing.env"
+          OVERRIDE="$RUNNER_TEMP/R149D.signing.xcconfig"
+          cat > "$OVERRIDE" <<'EOF'
+          PROVISIONING_PROFILE_SPECIFIER[sdk=iphoneos*] = $(R149D_PROFILE_$(TARGET_NAME:c99extidentifier))
+          PROVISIONING_PROFILE_SPECIFIER[sdk=watchos*] = $(R149D_PROFILE_$(TARGET_NAME:c99extidentifier))
+          R149D_PROFILE_Shared_iOS =
+          R149D_PROFILE_Shared_watchOS =
+          EOF
+          ARGS=(
+            "DEVELOPMENT_TEAM=$TEAM_ID"
+            "BUNDLE_ID_SUFFIX=.dev"
+            "CODE_SIGN_STYLE=Manual"
+            "CODE_SIGN_IDENTITY=Apple Distribution"
+            "ENABLE_CARPLAY=1"
+            "ENABLE_CRITICAL_ALERTS=0"
+            "ENABLE_PUSH_PROVIDER=0"
+            "ENABLE_THREAD_NETWORK_CREDENTIALS=0"
+            "ENABLE_DEVICE_NAME=0"
+            "R149D_PROFILE_App=$PROFILE_MAIN"
+            "R149D_PROFILE_Extensions_Intents=$PROFILE_INTENTS"
+            "R149D_PROFILE_Extensions_Matter=$PROFILE_MATTER"
+            "R149D_PROFILE_Extensions_NotificationContent=$PROFILE_NOTIFICATION_CONTENT"
+            "R149D_PROFILE_Extensions_NotificationService=$PROFILE_NOTIFICATION_SERVICE"
+            "R149D_PROFILE_Extensions_PushProvider=$PROFILE_PUSH_PROVIDER"
+            "R149D_PROFILE_Extensions_Share=$PROFILE_SHARE"
+            "R149D_PROFILE_Extensions_Widgets=$PROFILE_WIDGETS"
+            "R149D_PROFILE_WatchApp=$PROFILE_WATCH_APP"
+            "R149D_PROFILE_Extensions_WatchWidgets=$PROFILE_WATCH_WIDGETS"
+          )
+          check_profile() {
+            local sdk="$1" target="$2" expected="$3" log value
+            log="$(mktemp)"
+            xcodebuild -project HomeAssistant.xcodeproj -target "$target" -configuration Release -sdk "$sdk" -xcconfig "$OVERRIDE" "${ARGS[@]}" -showBuildSettings > "$log" 2>&1
+            value="$(awk -F ' = ' '/^[[:space:]]*PROVISIONING_PROFILE_SPECIFIER = /{print $2; exit}' "$log")"
+            rm -f "$log"
+            if [ "$value" != "$expected" ]; then
+              echo "SIGNING_OVERRIDE_TARGET=RED:$target"
+              exit 65
+            fi
+          }
+          check_profile iphoneos App "$PROFILE_MAIN"
+          check_profile iphoneos Extensions-Share "$PROFILE_SHARE"
+          check_profile iphoneos Shared-iOS ""
+          check_profile watchos WatchApp "$PROFILE_WATCH_APP"
+          check_profile watchos Shared-watchOS ""
+          echo "TARGET_AWARE_SIGNING_OVERRIDE=GREEN"
+
+      - name: Archive signed R149D
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/signing.env"
+          OUT="$RUNNER_TEMP/R149D_SIGNED"
+          ARCHIVE="$OUT/HomeAssistant.xcarchive"
+          LOG="$RUNNER_TEMP/r149d-archive.log"
+          OVERRIDE="$RUNNER_TEMP/R149D.signing.xcconfig"
+          rm -rf "$OUT"; mkdir -p "$OUT"
+          ARGS=(
+            "DEVELOPMENT_TEAM=$TEAM_ID"
+            "BUNDLE_ID_SUFFIX=.dev"
+            "CODE_SIGN_STYLE=Manual"
+            "CODE_SIGN_IDENTITY=Apple Distribution"
+            "ENABLE_CARPLAY=1"
+            "ENABLE_CRITICAL_ALERTS=0"
+            "ENABLE_PUSH_PROVIDER=0"
+            "ENABLE_THREAD_NETWORK_CREDENTIALS=0"
+            "ENABLE_DEVICE_NAME=0"
+            "R149D_PROFILE_App=$PROFILE_MAIN"
+            "R149D_PROFILE_Extensions_Intents=$PROFILE_INTENTS"
+            "R149D_PROFILE_Extensions_Matter=$PROFILE_MATTER"
+            "R149D_PROFILE_Extensions_NotificationContent=$PROFILE_NOTIFICATION_CONTENT"
+            "R149D_PROFILE_Extensions_NotificationService=$PROFILE_NOTIFICATION_SERVICE"
+            "R149D_PROFILE_Extensions_PushProvider=$PROFILE_PUSH_PROVIDER"
+            "R149D_PROFILE_Extensions_Share=$PROFILE_SHARE"
+            "R149D_PROFILE_Extensions_Widgets=$PROFILE_WIDGETS"
+            "R149D_PROFILE_WatchApp=$PROFILE_WATCH_APP"
+            "R149D_PROFILE_Extensions_WatchWidgets=$PROFILE_WATCH_WIDGETS"
+          )
+          set +e
+          xcodebuild -project HomeAssistant.xcodeproj -scheme App-Debug -configuration Release \
+            -destination 'generic/platform=iOS' -archivePath "$ARCHIVE" -xcconfig "$OVERRIDE" \
+            "${ARGS[@]}" archive > "$LOG" 2>&1
+          RC=$?
+          set -e
+          echo "ARCHIVE_RC=$RC"
+          if [ "$RC" -ne 0 ]; then
+            echo "R149D_ARCHIVE=RED"
+            grep -E 'No profile|does not support provisioning profiles|Provisioning|CodeSign|ARCHIVE FAILED|BUILD FAILED' "$LOG" | tail -120 || true
+            echo "ARCHIVE_ERROR_LINES=$(grep -Ec 'error:|fatal error:' "$LOG" || true)"
+            exit "$RC"
+          fi
+          test -d "$ARCHIVE"
+          echo "R149D_ARCHIVE=GREEN"
+
+      - name: Audit signed archive and CarPlay entitlement
+        shell: bash
+        run: |
+          set -euo pipefail
+          ARCHIVE="$RUNNER_TEMP/R149D_SIGNED/HomeAssistant.xcarchive"
+          APP="$(find "$ARCHIVE/Products/Applications" -maxdepth 1 -type d -name '*.app' | head -1)"
+          test -n "$APP"
+          codesign --verify --deep --strict "$APP"
+          ENT="$RUNNER_TEMP/r149d-entitlements.plist"
+          codesign -d --entitlements :- "$APP" > "$ENT" 2>/dev/null
+          /usr/libexec/PlistBuddy -c 'Print :com.apple.developer.carplay-driving-task' "$ENT" | grep -qx 'true'
+          COUNT="$(find "$APP" -name embedded.mobileprovision -type f | wc -l | tr -d ' ')"
+          test "$COUNT" = "10"
+          echo "CARPLAY_ENTITLEMENT=GREEN"
+          echo "EMBEDDED_PROFILES=10"
+          echo "SIGNED_ARCHIVE_AUDIT=GREEN"
+
+      - name: Create ExportOptions
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/signing.env"
+          export TEAM_ID PROFILE_MAIN PROFILE_INTENTS PROFILE_MATTER PROFILE_NOTIFICATION_CONTENT PROFILE_NOTIFICATION_SERVICE PROFILE_PUSH_PROVIDER PROFILE_SHARE PROFILE_WIDGETS PROFILE_WATCH_APP PROFILE_WATCH_WIDGETS BUNDLE_MAIN BUNDLE_INTENTS BUNDLE_MATTER BUNDLE_NOTIFICATION_CONTENT BUNDLE_NOTIFICATION_SERVICE BUNDLE_PUSH_PROVIDER BUNDLE_SHARE BUNDLE_WIDGETS BUNDLE_WATCH_APP BUNDLE_WATCH_WIDGETS
+          python3 - "$RUNNER_TEMP/ExportOptions.plist" <<'PY'
+          import os, pathlib, plistlib, sys
+          keys=['MAIN','INTENTS','MATTER','NOTIFICATION_CONTENT','NOTIFICATION_SERVICE','PUSH_PROVIDER','SHARE','WIDGETS','WATCH_APP','WATCH_WIDGETS']
+          profiles={os.environ['BUNDLE_'+k]:os.environ['PROFILE_'+k] for k in keys}
+          data={'method':'ad-hoc','teamID':os.environ['TEAM_ID'],'signingStyle':'manual','signingCertificate':'Apple Distribution','stripSwiftSymbols':True,'compileBitcode':False,'provisioningProfiles':profiles}
+          pathlib.Path(sys.argv[1]).write_bytes(plistlib.dumps(data))
+          PY
+          plutil -lint "$RUNNER_TEMP/ExportOptions.plist"
+          echo "EXPORT_OPTIONS=GREEN"
+
+      - name: Export signed IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/R149D_SIGNED"; ARCHIVE="$OUT/HomeAssistant.xcarchive"; EXPORT="$OUT/export"; LOG="$RUNNER_TEMP/r149d-export.log"
+          rm -rf "$EXPORT"; mkdir -p "$EXPORT"
+          set +e
+          xcodebuild -exportArchive -archivePath "$ARCHIVE" -exportPath "$EXPORT" -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" > "$LOG" 2>&1
+          RC=$?
+          set -e
+          echo "EXPORT_RC=$RC"
+          if [ "$RC" -ne 0 ]; then
+            echo "R149D_EXPORT=RED"
+            grep -E 'error:|failed|exportArchive|Provisioning|CodeSign' "$LOG" | tail -120 || true
+            exit "$RC"
+          fi
+          IPA="$(find "$EXPORT" -maxdepth 1 -type f -name '*.ipa' | head -1)"
+          test -n "$IPA"
+          FINAL="$RUNNER_TEMP/HomeAssistant_Cameras_CarPlay_R149D_XCODE27_SIGNED.ipa"
+          cp "$IPA" "$FINAL"
+          shasum -a 256 "$FINAL" > "$RUNNER_TEMP/HomeAssistant_Cameras_CarPlay_R149D_XCODE27_SIGNED.sha256"
+          unzip -t "$FINAL" >/dev/null
+          echo "R149D_EXPORT=GREEN"
+          echo "IPA_VALID=GREEN"
+
+      - name: Publish IPA only to private source repository
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_OUTPUT_TOKEN }}
+        run: |
+          set -euo pipefail
+          SOURCE_SHA="$(cat "$RUNNER_TEMP/source_sha.txt")"; SHORT_SHA="${SOURCE_SHA:0:8}"; TAG="xcode27-r149d-r2-${GITHUB_RUN_ID}-${SHORT_SHA}"
+          IPA="$RUNNER_TEMP/HomeAssistant_Cameras_CarPlay_R149D_XCODE27_SIGNED.ipa"
+          SHA="$RUNNER_TEMP/HomeAssistant_Cameras_CarPlay_R149D_XCODE27_SIGNED.sha256"
+          cat > "$RUNNER_TEMP/build-info.txt" <<EOF
+          R149D Xcode 27 signed build R2
+          Source ref: $SOURCE_REF
+          Source commit: $SOURCE_SHA
+          Runner: xcode-27 ARM64
+          Xcode: $(xcodebuild -version | tr '\n' ' ')
+          iOS SDK: $(xcrun --sdk iphoneos --show-sdk-version)
+          EOF
+          gh release create "$TAG" "$IPA#HomeAssistant_Cameras_CarPlay_R149D_XCODE27_SIGNED.ipa" "$SHA#HomeAssistant_Cameras_CarPlay_R149D_XCODE27_SIGNED.sha256" "$RUNNER_TEMP/build-info.txt#build-info.txt" \
+            --repo "$PRIVATE_SOURCE_REPO" --target "$SOURCE_SHA" --title "R149D Xcode 27 signed ${SHORT_SHA}" --notes "Signed on the Xcode 27 ARM64 builder. Source remains private." --prerelease
+          echo "PRIVATE_RELEASE_TAG=$TAG"
+          echo "PRIVATE_IPA_PUBLISHED=GREEN"
+
+      - name: Final result
+        shell: bash
+        run: |
+          echo "============================================================"
+          echo "R149D SIGNED IPA R2 / XCODE 27 = GREEN"
+          echo "============================================================"
+          echo "IOS_SDK=$(xcrun --sdk iphoneos --show-sdk-version)"
+
+      - name: Cleanup signing material
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          if [ -f "$RUNNER_TEMP/keychain_path.txt" ]; then
+            KEYCHAIN="$(cat "$RUNNER_TEMP/keychain_path.txt")"
+            security delete-keychain "$KEYCHAIN" >/dev/null 2>&1 || true
+          fi
+          rm -rf "$RUNNER_TEMP/r149d-distribution.p12" "$RUNNER_TEMP/r149d-profiles" "$RUNNER_TEMP/profile-meta.json" "$RUNNER_TEMP/signing.env" "$RUNNER_TEMP/ExportOptions.plist" "$RUNNER_TEMP/R149D.signing.xcconfig" "$RUNNER_TEMP/R149D_SIGNED" "$RUNNER_TEMP/HomeAssistant_Cameras_CarPlay_R149D_XCODE27_SIGNED.ipa" "$RUNNER_TEMP/HomeAssistant_Cameras_CarPlay_R149D_XCODE27_SIGNED.sha256" "$HOME/.appstoreconnect/private_keys"
+          echo "SIGNING_MATERIAL_CLEANED=YES"
