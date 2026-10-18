@@ -1,0 +1,64 @@
+name: Patch R149D R2 CLI Signing
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/patch-r149d-r2-cli-signing.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Patch R149D workflow and relaunch by push
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import base64, json, os, urllib.request
+
+          repo=os.environ['REPO']
+          token=os.environ['GH_TOKEN']
+          path='.github/workflows/r149d-signed-ipa-r2.yml'
+          api=f'https://api.github.com/repos/{repo}/contents/{path}?ref=main'
+          headers={
+              'Authorization':f'Bearer {token}',
+              'Accept':'application/vnd.github+json',
+              'X-GitHub-Api-Version':'2022-11-28',
+              'User-Agent':'r149d-signing-patcher',
+          }
+          req=urllib.request.Request(api,headers=headers)
+          with urllib.request.urlopen(req,timeout=60) as r:
+              obj=json.load(r)
+          text=base64.b64decode(obj['content']).decode()
+          old='            "CODE_SIGN_IDENTITY=Apple Distribution"\n'
+          new=old+'            "PROVISIONING_PROFILE_SPECIFIER=$(R149D_PROFILE_$(TARGET_NAME:c99extidentifier))"\n'
+          count=text.count(old)
+          if count != 2:
+              raise SystemExit(f'EXPECTED_2_IDENTITY_ANCHORS_GOT_{count}')
+          text=text.replace(old,new)
+          text=text.replace(' -xcconfig "$OVERRIDE"','')
+          old_diag='              echo "SIGNING_OVERRIDE_TARGET=RED:$target"\n              exit 65\n'
+          new_diag='              echo "SIGNING_OVERRIDE_TARGET=RED:$target"\n              echo "SIGNING_OVERRIDE_ACTUAL=${value:-<empty>}"\n              echo "SIGNING_OVERRIDE_EXPECTED=$expected"\n              exit 65\n'
+          if old_diag not in text:
+              raise SystemExit('DIAG_ANCHOR_NOT_FOUND')
+          text=text.replace(old_diag,new_diag,1)
+          payload=json.dumps({
+              'message':'R149D R3 CLI target-aware provisioning',
+              'content':base64.b64encode(text.encode()).decode(),
+              'sha':obj['sha'],
+              'branch':'main',
+          }).encode()
+          req=urllib.request.Request(api,data=payload,headers=headers,method='PUT')
+          with urllib.request.urlopen(req,timeout=60) as r:
+              out=json.load(r)
+          print('PATCH_COMMIT='+out['commit']['sha'])
+          print('R149D_CLI_SIGNING_PATCH=GREEN')
+          PY
